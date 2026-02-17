@@ -1,0 +1,322 @@
+// Package engine implements the Plumtree-inspired gossip event loop for
+// page invalidation dissemination. It replaces NATS pub/sub with two-tier
+// gossip: eager peers receive immediate QUIC datagram/stream pushes, lazy
+// peers receive batched QUIC stream deliveries.
+package engine
+
+import (
+	"context"
+	"encoding/binary"
+	"io"
+	"log"
+	"sync"
+	"time"
+
+	"github.com/wjordan/gossip-mesh/overlay"
+	"github.com/wjordan/gossip-mesh/transport"
+)
+
+// GossipEntry is a single gossip message (page invalidation, checkpoint, etc.).
+type GossipEntry struct {
+	Topic   uint16
+	Seq     uint64
+	Payload []byte // PageInvalidation or checkpoint data, unchanged format
+}
+
+// DeliveredEntry is an entry delivered to the SyncEngine for processing.
+type DeliveredEntry struct {
+	Topic   uint16
+	Seq     uint64
+	Payload []byte
+}
+
+// EngineConfig configures the gossip engine.
+type EngineConfig struct {
+	LazyBatchInterval time.Duration // default 50ms
+	GapTimeout        time.Duration // default 500ms
+	MaxGapBuffer      int           // default 64
+	DeliverBufferSize int           // default 256
+}
+
+func (c *EngineConfig) withDefaults() {
+	if c.LazyBatchInterval <= 0 {
+		c.LazyBatchInterval = 50 * time.Millisecond
+	}
+	if c.GapTimeout <= 0 {
+		c.GapTimeout = 500 * time.Millisecond
+	}
+	if c.MaxGapBuffer <= 0 {
+		c.MaxGapBuffer = 64
+	}
+	if c.DeliverBufferSize <= 0 {
+		c.DeliverBufferSize = 256
+	}
+}
+
+// GossipEngine is the main gossip event loop. It accepts local
+// invalidations via Enqueue(), disseminates them to peers via the
+// overlay, and delivers received entries to the SyncEngine via Deliver().
+type GossipEngine struct {
+	overlay   *overlay.Overlay
+	transport *transport.Transport
+	seen      *SeenTracker
+	applier   *OrderedApplier
+	repair    *RepairManager
+	cfg       EngineConfig
+
+	// Enqueue channel for local invalidations.
+	localCh chan GossipEntry
+
+	// Lazy batch accumulator (per lazy peer).
+	lazyMu      sync.Mutex
+	lazyBuffers map[string]*LazyBuffer // nodeID → buffer
+
+	// Output to SyncEngine.
+	deliverCh chan DeliveredEntry
+}
+
+// New creates a GossipEngine.
+func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEngine {
+	cfg.withDefaults()
+
+	g := &GossipEngine{
+		overlay:     o,
+		transport:   t,
+		seen:        &SeenTracker{},
+		cfg:         cfg,
+		localCh:     make(chan GossipEntry, 256),
+		lazyBuffers: make(map[string]*LazyBuffer),
+		deliverCh:   make(chan DeliveredEntry, cfg.DeliverBufferSize),
+	}
+
+	// Create ordered applier that delivers to the output channel.
+	g.applier = NewOrderedApplier(func(topic uint16, seq uint64, payload []byte) {
+		select {
+		case g.deliverCh <- DeliveredEntry{Topic: topic, Seq: seq, Payload: payload}:
+		default:
+			// Drop if buffer full — S3 poll fallback handles missed entries.
+		}
+	})
+	g.applier.maxGapBuffer = cfg.MaxGapBuffer
+	g.applier.gapTimeout = cfg.GapTimeout
+
+	g.repair = NewRepairManager(o, t, g.applier)
+
+	// Register transport handlers.
+	t.OnEagerGossip = g.onEagerReceive
+	t.OnLazyBatch = g.onLazyBatchReceive
+
+	return g
+}
+
+// Run starts the gossip engine event loop. Blocks until ctx is cancelled.
+func (g *GossipEngine) Run(ctx context.Context) {
+	lazyTick := time.NewTicker(g.cfg.LazyBatchInterval)
+	defer lazyTick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case entry := <-g.localCh:
+			g.handleLocal(entry)
+
+		case <-lazyTick.C:
+			g.flushLazyBatches()
+		}
+	}
+}
+
+// Enqueue submits a local invalidation for gossip dissemination.
+func (g *GossipEngine) Enqueue(topic uint16, seq uint64, payload []byte) {
+	g.localCh <- GossipEntry{
+		Topic:   topic,
+		Seq:     seq,
+		Payload: payload,
+	}
+}
+
+// Deliver returns the channel that SyncEngine reads from.
+func (g *GossipEngine) Deliver() <-chan DeliveredEntry {
+	return g.deliverCh
+}
+
+// Seen returns the SeenTracker for external use (e.g., setting initial seqs).
+func (g *GossipEngine) Seen() *SeenTracker {
+	return g.seen
+}
+
+// handleLocal processes a locally-produced entry.
+func (g *GossipEngine) handleLocal(entry GossipEntry) {
+	// Mark as seen.
+	g.seen.ShouldProcess(entry.Topic, entry.Seq)
+
+	// Eager forward to all eager peers.
+	g.eagerForward(entry, "")
+
+	// Enqueue for lazy batch to all lazy peers.
+	g.enqueueForLazy(entry, "")
+}
+
+// onEagerReceive is called by Transport when an eager gossip
+// message arrives.
+func (g *GossipEngine) onEagerReceive(from string, data []byte) {
+	entry, err := decodeEagerMessage(data)
+	if err != nil {
+		return
+	}
+
+	if !g.seen.ShouldProcess(entry.Topic, entry.Seq) {
+		return // already seen via another path
+	}
+
+	// Deliver to SyncEngine (via ordered applier).
+	g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
+
+	// Forward to OUR eager peers (excluding sender).
+	g.eagerForward(entry, from)
+
+	// Enqueue for OUR lazy peers (excluding sender).
+	g.enqueueForLazy(entry, from)
+}
+
+// onLazyBatchReceive is called by Transport when a lazy batch arrives.
+func (g *GossipEngine) onLazyBatchReceive(from string, reader io.Reader) {
+	batch, err := ReadLazyBatch(reader)
+	if err != nil {
+		log.Printf("gossip: decode lazy batch from %s: %v", from, err)
+		return
+	}
+
+	// Update our knowledge of what the sender has seen.
+	g.lazyMu.Lock()
+	buf, ok := g.lazyBuffers[from]
+	if ok {
+		buf.UpdatePeerSeqs(batch.SenderHighWaterMarks)
+	}
+	g.lazyMu.Unlock()
+
+	// Process each entry.
+	for _, entry := range batch.Entries {
+		if !g.seen.ShouldProcess(entry.Topic, entry.Seq) {
+			continue
+		}
+		g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
+		// Forward to OUR eager peers (excluding sender).
+		g.eagerForward(entry, from)
+		// Enqueue for OUR lazy peers (excluding sender).
+		g.enqueueForLazy(entry, from)
+	}
+}
+
+// eagerForward sends an entry to all eager peers (except excludeNodeID).
+func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
+	msg := encodeEagerMessage(entry)
+	peers := g.overlay.EagerPeers()
+
+	for _, peer := range peers {
+		if peer.NodeID == excludeNodeID {
+			continue
+		}
+		// Fire-and-forget via QUIC datagram.
+		// Errors are non-fatal: peer will get it via lazy batch or repair.
+		_ = g.transport.SendDatagram(peer.Addr, msg)
+	}
+}
+
+// enqueueForLazy adds an entry to lazy buffers for all lazy peers
+// (except excludeNodeID).
+func (g *GossipEngine) enqueueForLazy(entry GossipEntry, excludeNodeID string) {
+	peers := g.overlay.LazyPeers()
+
+	g.lazyMu.Lock()
+	defer g.lazyMu.Unlock()
+
+	for _, peer := range peers {
+		if peer.NodeID == excludeNodeID {
+			continue
+		}
+		buf, ok := g.lazyBuffers[peer.NodeID]
+		if !ok {
+			buf = NewLazyBuffer()
+			g.lazyBuffers[peer.NodeID] = buf
+		}
+		buf.Add(entry)
+	}
+}
+
+// flushLazyBatches sends accumulated lazy batches to all lazy peers.
+func (g *GossipEngine) flushLazyBatches() {
+	peers := g.overlay.LazyPeers()
+	myMarks := g.seen.HighWaterMarks()
+
+	g.lazyMu.Lock()
+	// Collect non-empty batches.
+	type peerBatch struct {
+		addr  string
+		batch LazyBatch
+	}
+	var batches []peerBatch
+	for _, peer := range peers {
+		buf, ok := g.lazyBuffers[peer.NodeID]
+		if !ok || buf.Len() == 0 {
+			continue
+		}
+		entries := buf.Flush()
+		batches = append(batches, peerBatch{
+			addr: peer.Addr,
+			batch: LazyBatch{
+				Entries:              entries,
+				SenderHighWaterMarks: myMarks,
+			},
+		})
+	}
+	g.lazyMu.Unlock()
+
+	// Send each batch (outside the lock).
+	for _, pb := range batches {
+		go g.sendLazyBatch(pb.addr, pb.batch)
+	}
+}
+
+// sendLazyBatch sends a lazy batch to a peer via QUIC uni stream.
+func (g *GossipEngine) sendLazyBatch(addr string, batch LazyBatch) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := g.transport.OpenUniStream(ctx, addr)
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+
+	// Write stream type prefix.
+	if _, err := stream.Write([]byte{transport.StreamTypeLazyBatch}); err != nil {
+		return
+	}
+
+	if err := WriteLazyBatch(stream, batch); err != nil {
+		return
+	}
+}
+
+// Eager message encoding: [2B topic BE][8B seq BE][payload...]
+func encodeEagerMessage(entry GossipEntry) []byte {
+	msg := make([]byte, 2+8+len(entry.Payload))
+	binary.BigEndian.PutUint16(msg[0:], entry.Topic)
+	binary.BigEndian.PutUint64(msg[2:], entry.Seq)
+	copy(msg[10:], entry.Payload)
+	return msg
+}
+
+func decodeEagerMessage(data []byte) (GossipEntry, error) {
+	if len(data) < 10 {
+		return GossipEntry{}, io.ErrUnexpectedEOF
+	}
+	return GossipEntry{
+		Topic:   binary.BigEndian.Uint16(data[0:]),
+		Seq:     binary.BigEndian.Uint64(data[2:]),
+		Payload: data[10:],
+	}, nil
+}
