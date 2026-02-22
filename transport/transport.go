@@ -195,6 +195,22 @@ func (t *Transport) GetConnection(addr string) *quic.Conn {
 	return conn
 }
 
+// AddConnection registers an externally established QUIC connection
+// (e.g., from hole punching or relay) in the app transport and starts
+// accept loops on it.
+func (t *Transport) AddConnection(conn *quic.Conn) {
+	addr := conn.RemoteAddr().String()
+	t.appConns.Store(addr, conn)
+	t.startAcceptLoop(conn)
+}
+
+// QUICTransport returns the underlying QUIC transport. This is needed for
+// hole punching — outgoing dials must originate from the same UDP socket
+// as the listener so the NAT mapping is preserved.
+func (t *Transport) QUICTransport() *quic.Transport {
+	return t.transport
+}
+
 // Shutdown closes the transport and waits for goroutines to finish.
 func (t *Transport) Shutdown() error {
 	close(t.shutdownCh)

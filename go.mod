@@ -6,7 +6,7 @@ require (
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/klauspost/compress v1.18.3
 	github.com/quic-go/quic-go v0.59.0
-	github.com/wjordan/memberlist-quic v0.1.0
+	github.com/wjordan/memberlist-quic v0.1.1
 	github.com/wjordan/vivaldi v0.1.0
 )
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/memberlist"
+	"github.com/quic-go/quic-go"
 	memberlistquic "github.com/wjordan/memberlist-quic"
 	"github.com/wjordan/vivaldi"
 )
@@ -217,6 +218,27 @@ func (m *Membership) AddrForNode(nodeID string) string {
 // FluiteTransport reuses this to share the same CA.
 func (m *Membership) TLSConfig() *tls.Config {
 	return m.tlsConfig
+}
+
+// InjectConnection registers an externally established QUIC connection
+// (e.g., from hole punching or relay) in the memberlist connection pool
+// and makes SWIM aware of the peer.
+func (m *Membership) InjectConnection(conn *quic.Conn, addr string) error {
+	pool := m.ConnPool()
+	if pool == nil {
+		return fmt.Errorf("membership: transport not initialized")
+	}
+	pool.AddInbound(conn)
+	if _, err := m.list.Join([]string{addr}); err != nil {
+		return fmt.Errorf("membership: join injected peer: %w", err)
+	}
+	return nil
+}
+
+// QUICTransport returns the memberlist-quic transport, providing access to
+// RawTransport() for hole punching.
+func (m *Membership) QUICTransport() *memberlistquic.Transport {
+	return m.quicTransport
 }
 
 // notifyChange calls the onChange callback with a snapshot of peers.

@@ -10,4 +10,10 @@ const (
 const (
 	StreamTypeLazyBatch byte = 0x11
 	StreamTypeRepair    byte = 0x16
+	StreamTypeRelay     byte = 0x40 // relay forwarding
+)
+
+// Additional datagram message types.
+const (
+	MsgTypeAddrReflect byte = 0x30 // address reflection
 )
