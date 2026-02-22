@@ -1,9 +1,10 @@
 // Package mesh provides a unified entry point for joining a gossip-mesh cluster.
-// It supports two modes:
-//   - S3-coordinated: uses an object store for TLS bootstrap, peer discovery,
-//     hole punching, and relay — works across NAT boundaries.
-//   - Direct: uses pre-configured TLS and seed addresses — requires direct IP
-//     reachability (the existing behavior).
+//
+// Seeds and gossip are the primary discovery mechanism. S3 is a side-channel
+// for situations where the mesh can't self-heal: cold starts with zero known
+// peers, partitioned NATs, or peers behind different NATs with no shared
+// gossip neighbor. Both can be used together — seeds provide the fast path,
+// S3 fills in what seeds can't reach.
 package mesh
 
 import (
@@ -33,14 +34,19 @@ type Config struct {
 	BindAddr  string
 	BindPort  int // memberlist port; app = BindPort+1
 
-	// Mode 1: S3-coordinated (NAT-friendly).
-	// Set ObjectStore to enable S3-based bootstrap, discovery, and NAT traversal.
+	// ObjectStore enables S3-coordinated bootstrap (TLS, peer discovery,
+	// NAT traversal). Can be combined with SeedAddrs — seeds provide the
+	// fast path, S3 discovers peers that seeds can't reach.
 	ObjectStore objstore.ObjectStore
 
-	// Mode 2: Direct connectivity (existing behavior).
-	// Set SeedAddrs and TLS for direct membership.
+	// SeedAddrs are memberlist addresses to join on startup. Always used
+	// when provided, regardless of whether ObjectStore is set.
 	SeedAddrs []string
-	TLS       *tls.Config
+
+	// TLS is the TLS config for direct connectivity mode. When ObjectStore
+	// is set, TLS is bootstrapped from the object store and this field is
+	// ignored.
+	TLS *tls.Config
 
 	AdvertiseAddr string
 	AdvertisePort int
@@ -80,6 +86,7 @@ type Mesh struct {
 	Overlay    *overlay.Overlay
 	Engine     *engine.GossipEngine
 
+	cfg         Config
 	store       objstore.ObjectStore
 	reg         *bootstrap.NodeRegistration
 	cancel      context.CancelFunc
@@ -88,14 +95,15 @@ type Mesh struct {
 	logger      *log.Logger
 }
 
-// Join starts a gossip-mesh node. When cfg.ObjectStore is set, it performs
-// S3-coordinated bootstrap with NAT traversal. Otherwise, it uses direct
-// connectivity with pre-configured TLS and seed addresses.
+// Join starts a gossip-mesh node. Seeds are always joined immediately when
+// provided. When ObjectStore is also set, S3-based discovery runs in parallel
+// to find additional peers that seeds can't reach (cross-NAT, fresh clusters).
 func Join(cfg Config) (*Mesh, error) {
 	cfg.withDefaults()
 
 	m := &Mesh{
 		Membership: &membership.Membership{},
+		cfg:        cfg,
 		store:      cfg.ObjectStore,
 		logger:     cfg.Logger,
 	}
@@ -106,7 +114,7 @@ func Join(cfg Config) (*Mesh, error) {
 	var tlsConfig *tls.Config
 
 	if cfg.ObjectStore != nil {
-		// S3-coordinated mode: bootstrap TLS from object store.
+		// Bootstrap TLS from object store.
 		bindIP := net.ParseIP(cfg.BindAddr)
 		ips := []net.IP{net.IPv4(127, 0, 0, 1), net.IPv6loopback}
 		if bindIP != nil && !bindIP.IsLoopback() && !bindIP.IsUnspecified() {
@@ -120,7 +128,6 @@ func Join(cfg Config) (*Mesh, error) {
 			return nil, fmt.Errorf("setup cluster TLS: %w", err)
 		}
 	} else {
-		// Direct mode: use provided TLS config.
 		tlsConfig = cfg.TLS
 	}
 
@@ -129,20 +136,16 @@ func Join(cfg Config) (*Mesh, error) {
 		return nil, fmt.Errorf("mesh: TLS config required (provide ObjectStore or TLS)")
 	}
 
-	// Start membership layer.
+	// Start membership layer. Always pass seeds — they're the fast path.
 	memCfg := membership.MembershipConfig{
 		NodeID:        cfg.NodeID,
 		BindAddr:      cfg.BindAddr,
 		BindPort:      cfg.BindPort,
 		AdvertiseAddr: cfg.AdvertiseAddr,
 		AdvertisePort: cfg.AdvertisePort,
+		SeedAddrs:     cfg.SeedAddrs,
 		Meta:          cfg.Meta,
 		TLS:           tlsConfig,
-	}
-
-	// In S3 mode, don't join seeds yet — we'll discover peers via S3.
-	if cfg.ObjectStore == nil {
-		memCfg.SeedAddrs = cfg.SeedAddrs
 	}
 
 	if err := m.Membership.Start(memCfg); err != nil {
@@ -166,20 +169,11 @@ func Join(cfg Config) (*Mesh, error) {
 	}
 	m.Transport = t
 
-	// Register address reflection handler.
+	// Register address reflection handler (used by both modes).
 	natutil.RegisterReflectHandler(t)
 
-	if cfg.ObjectStore != nil {
-		// S3-coordinated: register, discover peers, handle NAT.
-		if err := m.s3Bootstrap(ctx, cfg); err != nil {
-			t.Shutdown()
-			m.Membership.Stop()
-			cancel()
-			return nil, fmt.Errorf("s3 bootstrap: %w", err)
-		}
-	}
-
-	// Start overlay and engine.
+	// Start overlay and engine before S3 discovery so that peers connected
+	// via seeds are immediately usable for gossip.
 	m.Overlay = overlay.New(cfg.NodeID, cfg.Overlay)
 	m.Engine = engine.New(m.Overlay, t, cfg.Engine)
 
@@ -196,19 +190,31 @@ func Join(cfg Config) (*Mesh, error) {
 		m.Overlay.Reclassify(overlayPeers)
 	})
 
-	// Start accept loops on existing memberlist connections.
+	// Start accept loops on existing memberlist connections (from seed joins).
 	t.StartAcceptLoopAll()
+
+	// S3 discovery runs as a background supplement — never blocks Join().
+	if cfg.ObjectStore != nil {
+		if err := m.startS3Coordination(ctx, cfg); err != nil {
+			t.Shutdown()
+			m.Membership.Stop()
+			cancel()
+			return nil, fmt.Errorf("s3 coordination: %w", err)
+		}
+	}
 
 	return m, nil
 }
 
-// s3Bootstrap handles S3-coordinated peer discovery and NAT traversal.
-func (m *Mesh) s3Bootstrap(ctx context.Context, cfg Config) error {
+// startS3Coordination registers this node in the object store and starts
+// background loops for discovery, heartbeat, and NAT traversal. It does not
+// block on peer connections — those happen in the background.
+func (m *Mesh) startS3Coordination(ctx context.Context, cfg Config) error {
 	appPort := cfg.BindPort + 1
 	bindAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.BindPort)
 	appAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, appPort)
 
-	// Register ourselves.
+	// Register ourselves in the object store.
 	reg := bootstrap.NodeRegistration{
 		NodeID: cfg.NodeID,
 		Addrs:  []string{bindAddr, appAddr},
@@ -218,90 +224,118 @@ func (m *Mesh) s3Bootstrap(ctx context.Context, cfg Config) error {
 	}
 	m.reg = &reg
 
-	// Discover peers.
-	peers, err := bootstrap.DiscoverPeers(ctx, cfg.ObjectStore, cfg.StaleNodeAge)
-	if err != nil {
-		return fmt.Errorf("discover peers: %w", err)
-	}
+	// Initial S3 discovery — connect to peers that seeds didn't reach.
+	m.discoverAndConnect(ctx, cfg, appAddr)
 
-	// Try to connect to each discovered peer.
-	for _, peer := range peers {
-		if peer.NodeID == cfg.NodeID {
-			continue
-		}
-
-		connected := false
-
-		// Try direct connection first via memberlist addrs.
-		for _, addr := range peer.Addrs {
-			conn, err := m.Membership.ConnPool().GetOrDial(ctx, addr)
-			if err == nil {
-				if err := m.Membership.InjectConnection(conn, addr); err != nil {
-					m.logger.Printf("[DEBUG] mesh: inject peer %s at %s: %v", peer.NodeID, addr, err)
-				}
-				connected = true
-				break
-			}
-		}
-		if connected {
-			continue
-		}
-
-		// Direct connection failed — try hole punch if we have a public addr.
-		if peer.PublicAddr != "" {
-			m.logger.Printf("[DEBUG] mesh: attempting hole punch to %s at %s", peer.NodeID, peer.PublicAddr)
-			punchParams := holepunch.PunchParams{
-				Store:         cfg.ObjectStore,
-				QUICTransport: m.Transport.QUICTransport(),
-				TLSConfig:     m.Membership.TLSConfig(),
-				QUICConfig: &quic.Config{
-					MaxIdleTimeout:  30 * time.Second,
-					KeepAlivePeriod: 10 * time.Second,
-					EnableDatagrams: true,
-				},
-				SelfID:   cfg.NodeID,
-				TargetID: peer.NodeID,
-				SelfAddr: appAddr,
-			}
-			conn, err := holepunch.AttemptHolePunch(ctx, punchParams)
-			if err == nil {
-				m.Transport.AddConnection(conn)
-				addr := conn.RemoteAddr().String()
-				if err := m.Membership.InjectConnection(conn, addr); err != nil {
-					m.logger.Printf("[WARN] mesh: inject hole-punched connection to %s: %v", peer.NodeID, err)
-				}
-				continue
-			}
-			m.logger.Printf("[DEBUG] mesh: hole punch to %s failed: %v, trying relay", peer.NodeID, err)
-		}
-
-		// Hole punch failed or unavailable — find a relay.
-		if peer.IsRelay {
-			// This peer IS a relay, but we can't reach it. Skip.
-			continue
-		}
-		m.tryRelay(ctx, cfg, peer)
-	}
-
-	// Start heartbeat loop.
+	// Background heartbeat.
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		bootstrap.HeartbeatLoop(ctx, cfg.ObjectStore, reg, cfg.HeartbeatInterval)
+		bootstrap.HeartbeatLoop(ctx, cfg.ObjectStore, m.reg, cfg.HeartbeatInterval)
 	}()
 
-	// Start steady-state discovery loop.
+	// Background steady-state discovery.
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		m.steadyStateLoop(ctx, cfg)
+		m.steadyStateLoop(ctx, cfg, appAddr)
 	}()
 
 	return nil
 }
 
-// tryRelay attempts to connect to a peer via any known relay node.
+// discoverAndConnect queries S3 for peers and attempts to connect to any
+// that SWIM doesn't already know about. For each unknown peer it tries,
+// in order: memberlist Join (fast, works if directly reachable), hole punch
+// (works across NAT if both sides cooperate), relay (last resort).
+func (m *Mesh) discoverAndConnect(ctx context.Context, cfg Config, appAddr string) {
+	peers, err := bootstrap.DiscoverPeers(ctx, cfg.ObjectStore, cfg.StaleNodeAge)
+	if err != nil {
+		m.logger.Printf("[WARN] mesh: s3 discovery failed: %v", err)
+		return
+	}
+
+	for _, peer := range peers {
+		if peer.NodeID == cfg.NodeID {
+			continue
+		}
+
+		// Skip peers that SWIM already knows about — gossip is handling them.
+		if m.Membership.IsAlive(peer.NodeID) {
+			continue
+		}
+
+		// Try memberlist Join first — this is the fast, normal path.
+		// It works when the peer is directly reachable (same VPC, no NAT).
+		if m.tryMemberlistJoin(peer) {
+			continue
+		}
+
+		// Direct join failed — escalate to NAT traversal.
+		if m.tryHolePunch(ctx, cfg, peer, appAddr) {
+			continue
+		}
+
+		// Hole punch failed — try relay as last resort.
+		m.tryRelay(ctx, cfg, peer)
+	}
+}
+
+// tryMemberlistJoin attempts to connect to a peer via normal memberlist Join
+// using the addresses from their S3 registration. This is the fast path —
+// no S3 round-trips, just a direct QUIC dial.
+func (m *Mesh) tryMemberlistJoin(peer bootstrap.NodeRegistration) bool {
+	if len(peer.Addrs) == 0 {
+		return false
+	}
+	// memberlist Join tries each address and only needs one to succeed.
+	// Use the memberlist-port addresses (first addr in registration).
+	_, err := m.Membership.Join(peer.Addrs[:1])
+	return err == nil
+}
+
+// tryHolePunch attempts S3-signaled simultaneous QUIC open to a NATed peer.
+func (m *Mesh) tryHolePunch(ctx context.Context, cfg Config, peer bootstrap.NodeRegistration, selfAddr string) bool {
+	if peer.PublicAddr == "" {
+		return false
+	}
+
+	m.logger.Printf("[DEBUG] mesh: attempting hole punch to %s at %s", peer.NodeID, peer.PublicAddr)
+	punchParams := holepunch.PunchParams{
+		Store:         cfg.ObjectStore,
+		QUICTransport: m.Transport.QUICTransport(),
+		TLSConfig:     m.Membership.TLSConfig(),
+		QUICConfig: &quic.Config{
+			MaxIdleTimeout:  30 * time.Second,
+			KeepAlivePeriod: 10 * time.Second,
+			EnableDatagrams: true,
+		},
+		SelfID:   cfg.NodeID,
+		TargetID: peer.NodeID,
+		SelfAddr: selfAddr,
+	}
+
+	conn, err := holepunch.AttemptHolePunch(ctx, punchParams)
+	if err != nil {
+		m.logger.Printf("[DEBUG] mesh: hole punch to %s failed: %v", peer.NodeID, err)
+		return false
+	}
+
+	m.Transport.AddConnection(conn)
+	addr := conn.RemoteAddr().String()
+	if err := m.Membership.InjectConnection(conn, addr); err != nil {
+		m.logger.Printf("[WARN] mesh: inject hole-punched connection to %s: %v", peer.NodeID, err)
+	}
+	return true
+}
+
+// tryRelay attempts to reach a peer via a relay node with a public IP.
 func (m *Mesh) tryRelay(ctx context.Context, cfg Config, target bootstrap.NodeRegistration) {
+	if target.IsRelay {
+		// This peer IS a relay but we can't reach it directly — nothing to do.
+		return
+	}
+
 	peers, err := bootstrap.DiscoverPeers(ctx, cfg.ObjectStore, cfg.StaleNodeAge)
 	if err != nil {
 		return
@@ -310,7 +344,6 @@ func (m *Mesh) tryRelay(ctx context.Context, cfg Config, target bootstrap.NodeRe
 		if !p.IsRelay || p.NodeID == cfg.NodeID || p.NodeID == target.NodeID {
 			continue
 		}
-		// Try relay through this peer.
 		relayAddr := p.PublicAddr
 		if relayAddr == "" && len(p.Addrs) > 0 {
 			relayAddr = p.Addrs[0]
@@ -324,14 +357,16 @@ func (m *Mesh) tryRelay(ctx context.Context, cfg Config, target bootstrap.NodeRe
 			m.logger.Printf("[DEBUG] mesh: relay via %s to %s failed: %v", p.NodeID, target.NodeID, err)
 			continue
 		}
-		_ = stream // Relayed stream established — used for SWIM probes
+		_ = stream
 		m.logger.Printf("[INFO] mesh: relayed connection to %s via %s", target.NodeID, p.NodeID)
 		return
 	}
 }
 
-// steadyStateLoop periodically discovers new peers and connects to them.
-func (m *Mesh) steadyStateLoop(ctx context.Context, cfg Config) {
+// steadyStateLoop periodically polls S3 for new peers that gossip hasn't
+// discovered yet. This catches nodes behind different NATs that join after
+// us and have no shared gossip neighbor.
+func (m *Mesh) steadyStateLoop(ctx context.Context, cfg Config, appAddr string) {
 	ticker := time.NewTicker(cfg.SteadyStatePollInterval)
 	defer ticker.Stop()
 
@@ -340,27 +375,7 @@ func (m *Mesh) steadyStateLoop(ctx context.Context, cfg Config) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			peers, err := bootstrap.DiscoverPeers(ctx, cfg.ObjectStore, cfg.StaleNodeAge)
-			if err != nil {
-				m.logger.Printf("[WARN] mesh: steady-state discovery failed: %v", err)
-				continue
-			}
-
-			// Try to connect to any peers we don't already know about.
-			for _, peer := range peers {
-				if peer.NodeID == cfg.NodeID {
-					continue
-				}
-				if m.Membership.IsAlive(peer.NodeID) {
-					continue
-				}
-				// Try direct connect.
-				for _, addr := range peer.Addrs {
-					if _, err := m.Membership.ConnPool().GetOrDial(ctx, addr); err == nil {
-						break
-					}
-				}
-			}
+			m.discoverAndConnect(ctx, cfg, appAddr)
 		}
 	}
 }

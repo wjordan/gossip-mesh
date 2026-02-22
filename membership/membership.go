@@ -235,6 +235,15 @@ func (m *Membership) InjectConnection(conn *quic.Conn, addr string) error {
 	return nil
 }
 
+// Join attempts to reach the given memberlist addresses and merge with
+// the cluster. It is safe to call multiple times with different addresses.
+func (m *Membership) Join(addrs []string) (int, error) {
+	if m.list == nil {
+		return 0, fmt.Errorf("membership: not started")
+	}
+	return m.list.Join(addrs)
+}
+
 // QUICTransport returns the memberlist-quic transport, providing access to
 // RawTransport() for hole punching.
 func (m *Membership) QUICTransport() *memberlistquic.Transport {

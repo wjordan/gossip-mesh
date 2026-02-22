@@ -80,8 +80,10 @@ func DiscoverPeers(ctx context.Context, store objstore.ObjectStore, maxAge time.
 }
 
 // HeartbeatLoop periodically re-registers the node to keep its heartbeat fresh.
-// It blocks until ctx is cancelled.
-func HeartbeatLoop(ctx context.Context, store objstore.ObjectStore, reg NodeRegistration, interval time.Duration) {
+// It reads the current registration from reg each tick, so updates made by the
+// caller (e.g., setting PublicAddr after NAT detection) are picked up
+// automatically. Blocks until ctx is cancelled.
+func HeartbeatLoop(ctx context.Context, store objstore.ObjectStore, reg *NodeRegistration, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -90,7 +92,7 @@ func HeartbeatLoop(ctx context.Context, store objstore.ObjectStore, reg NodeRegi
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			_ = Register(ctx, store, reg)
+			_ = Register(ctx, store, *reg)
 		}
 	}
 }
