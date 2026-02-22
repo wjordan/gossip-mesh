@@ -31,57 +31,79 @@ gossip-mesh implements the Plumtree eager/lazy split over QUIC, with several add
 
 - **Application transport.** A separate QUIC listener for application-level traffic (streams and datagrams), with a handler registry for custom message types alongside the built-in gossip types.
 
-- **S3-coordinated NAT traversal.** Nodes behind NATs (residential ISPs, CGNAT, corporate firewalls) can join the mesh using an S3-compatible object store for TLS bootstrap, peer discovery, hole punching, and relay. No additional infrastructure beyond the object store.
+- **Extensible discovery.** The `mesh` package accepts a `DiscoveryExtension` interface for plugging in additional peer discovery mechanisms. The `s3nat` package provides an S3-coordinated extension with NAT traversal.
 
-## Connectivity modes
+## Architecture
 
-gossip-mesh supports two connectivity modes that can be used independently or together:
+The base mesh uses **seeds and memberlist gossip** for peer discovery. This works when nodes have direct IP reachability (same VPC, overlay network, public IPs). The `mesh.Join()` entry point wires the core packages together:
 
-**Direct mode** -- provide seed addresses and a TLS config. Nodes dial seeds on startup and discover the rest of the cluster through memberlist gossip. This is the fast path and works when nodes have direct IP reachability (same VPC, overlay network, public IPs).
+```
+mesh.Join()
+  ├── membership  (SWIM over QUIC — join/leave/failure detection)
+  ├── transport   (app-level QUIC streams + datagrams)
+  ├── overlay     (eager/lazy peer classification by RTT)
+  ├── engine      (Plumtree gossip loop)
+  └── [DiscoveryExtension]  (optional — e.g., s3nat)
+```
 
-**S3-coordinated mode** -- provide an `ObjectStore` implementation. Nodes bootstrap TLS from a shared CA in the object store, register themselves, and discover peers via S3. For peers behind NAT, the library escalates through hole punching (simultaneous QUIC open coordinated via S3 signaling) and relay (traffic forwarded through a public-IP node).
+The `DiscoveryExtension` interface lets external packages extend the mesh with additional peer discovery and connectivity without the base mesh knowing about their dependencies:
 
-When both are provided, they layer naturally:
+```go
+type DiscoveryExtension interface {
+    Start(ctx context.Context, m *Mesh) error
+    Stop() error
+}
+```
 
-1. Seeds are joined immediately (fast path -- no S3 latency).
+### S3-coordinated NAT traversal (`s3nat` package)
+
+The `s3nat` extension enables nodes behind NATs (residential ISPs, CGNAT, corporate firewalls) to join the mesh using an S3-compatible object store. S3 is a side-channel for situations where the mesh can't self-heal — it handles bootstrap and NAT traversal, then gets out of the way.
+
+Seeds and S3 discovery layer naturally:
+
+1. Seeds are joined immediately (fast path — no S3 latency).
 2. S3 discovery runs in parallel, finding peers that seeds can't reach.
-3. For each S3-discovered peer not already known via gossip, try memberlist Join first (direct dial), then hole punch, then relay.
-4. Once any connection exists, memberlist gossip propagates the rest of the membership -- S3 is no longer needed for that peer.
-5. A background loop polls S3 periodically for new joiners that gossip hasn't discovered yet (e.g., nodes behind different NATs with no shared gossip neighbor).
+3. For each S3-discovered peer not already known via gossip, escalate: memberlist Join → hole punch → relay.
+4. Once any connection exists, memberlist gossip propagates the rest of the membership.
+5. A background loop polls S3 periodically for new joiners that gossip hasn't discovered yet.
 
-S3 handles bootstrap only. SWIM (memberlist) handles steady-state membership. Gossip handles message dissemination. The object store is a side-channel for situations where the mesh can't self-heal.
+**No heartbeat loop.** Dead node cleanup is driven by SWIM failure detection — when memberlist marks a node dead, any peer that notices deletes its S3 registration. S3 writes happen only on join, leave, and peer failure.
 
-### Object store key layout
+#### Object store key layout
 
 ```
 {prefix}/
   ca/cert.pem                           # shared CA certificate
   ca/key.pem                            # CA private key (nodes self-sign)
-  nodes/{node-id}                       # node registration JSON + heartbeat
+  nodes/{node-id}                       # node registration JSON
   signal/{lower-id}/{higher-id}/{id}    # hole-punch signaling (ephemeral)
 ```
 
-### NAT traversal escalation
+#### NAT traversal escalation
 
 For each peer discovered via S3 that isn't already known to SWIM:
 
-1. **memberlist Join** -- try the peer's registered addresses directly. Works if the peer is reachable (same network, public IP, port-forwarded).
-2. **Hole punch** -- both peers write signals to S3, poll for each other, then simultaneously dial from their listener socket. QUIC handles dual-connect resolution. Works for cone NAT (most residential/mobile NAT).
-3. **Relay** -- route through a node with a public IP. The relay bridges two QUIC bidi streams. Works for symmetric NAT where hole punching fails.
-
-### S3 heartbeat
-
-Each node periodically re-PUTs its registration JSON (default every 30s) to keep the `Heartbeat` timestamp fresh. `DiscoverPeers` ignores registrations older than `StaleNodeAge` (default 2 min) and garbage-collects them. This gives registrations an effective TTL so new joiners don't waste time connecting to dead nodes. The heartbeat also picks up any updates to the registration (e.g., `PublicAddr` learned after NAT detection).
+1. **memberlist Join** — try the peer's registered addresses directly. Works if the peer is reachable (same network, public IP, port-forwarded).
+2. **Hole punch** — both peers write signals to S3, poll for each other, then simultaneously dial from their listener socket. QUIC handles dual-connect resolution. Works for cone NAT (most residential/mobile NAT).
+3. **Relay** — route through a node with a public IP. The relay bridges two QUIC bidi streams. Works for symmetric NAT where hole punching fails.
 
 ## Packages
 
+### Core
+
 | Package | Role |
 |---------|------|
-| `mesh` | Unified `Join()`/`Leave()` entry point -- wires everything together |
+| `mesh` | Unified `Join()`/`Leave()` entry point, `DiscoveryExtension` interface |
 | `membership` | Cluster join/leave, peer discovery, Vivaldi RTT estimation, extensible node metadata |
 | `transport` | QUIC streams + datagrams, handler registry for application-defined message types |
 | `overlay` | Eager/lazy peer classification with RTT clustering for cross-region connectivity |
 | `engine` | Gossip event loop: enqueue, dedup, ordered delivery, lazy batching, gap repair |
+
+### S3/NAT extension
+
+| Package | Role |
+|---------|------|
+| `s3nat` | `DiscoveryExtension` — S3 coordination, NAT traversal orchestration |
 | `objstore` | `ObjectStore` interface + in-memory implementation for tests |
 | `bootstrap` | TLS CA bootstrap, node registration, peer discovery via object store |
 | `natutil` | Address reflection, NAT detection |
@@ -98,48 +120,7 @@ Requires Go 1.24+ and mutual TLS (bootstrapped from object store, or provided di
 
 ## Quick start
 
-### Using the mesh package (recommended)
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-
-    "github.com/wjordan/gossip-mesh/mesh"
-    "github.com/wjordan/gossip-mesh/membership"
-)
-
-func main() {
-    // S3-coordinated mode with seed fallback.
-    m, err := mesh.Join(mesh.Config{
-        NodeID:      "node-1",
-        BindAddr:    "0.0.0.0",
-        BindPort:    7946,
-        SeedAddrs:   []string{"10.0.0.1:7946"}, // optional fast path
-        ObjectStore: myS3Store,                   // enables NAT traversal
-        Meta: membership.NodeMeta{
-            QUICAddr: "0.0.0.0",
-            QUICPort: 7947,
-        },
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer m.Leave()
-
-    // Publish and consume gossip messages.
-    m.Engine.Enqueue(0, 1, []byte("hello cluster"))
-
-    for entry := range m.Engine.Deliver() {
-        fmt.Printf("topic=%d seq=%d payload=%s\n",
-            entry.Topic, entry.Seq, entry.Payload)
-    }
-}
-```
-
-### Direct mode (no object store)
+### Direct mode (seeds + TLS)
 
 ```go
 m, err := mesh.Join(mesh.Config{
@@ -147,7 +128,50 @@ m, err := mesh.Join(mesh.Config{
     BindAddr:  "0.0.0.0",
     BindPort:  7946,
     SeedAddrs: []string{"10.0.0.1:7946"},
-    TLS:       tlsCfg, // your TLS setup
+    TLS:       tlsCfg,
+    Meta: membership.NodeMeta{
+        QUICAddr: "0.0.0.0",
+        QUICPort: 7947,
+    },
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer m.Leave()
+
+m.Engine.Enqueue(0, 1, []byte("hello cluster"))
+
+for entry := range m.Engine.Deliver() {
+    fmt.Printf("topic=%d seq=%d payload=%s\n",
+        entry.Topic, entry.Seq, entry.Payload)
+}
+```
+
+### With S3 NAT traversal
+
+```go
+// Create the S3 NAT extension.
+ext := s3nat.New(s3nat.Config{
+    ObjectStore: myS3Store,
+})
+
+// Bootstrap TLS from the shared CA in S3.
+tlsCfg, err := ext.SetupTLS(ctx, "node-1", []net.IP{
+    net.IPv4(127, 0, 0, 1),
+    net.IPv6loopback,
+})
+if err != nil {
+    log.Fatal(err)
+}
+
+// Join with seeds (fast path) + S3 discovery (NAT fallback).
+m, err := mesh.Join(mesh.Config{
+    NodeID:    "node-1",
+    BindAddr:  "0.0.0.0",
+    BindPort:  7946,
+    SeedAddrs: []string{"10.0.0.1:7946"}, // optional
+    TLS:       tlsCfg,
+    Discovery: ext,
     Meta: membership.NodeMeta{
         QUICAddr: "0.0.0.0",
         QUICPort: 7947,

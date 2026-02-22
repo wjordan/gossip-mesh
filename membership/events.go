@@ -44,8 +44,12 @@ func (e *eventDelegate) NotifyLeave(node *memberlist.Node) {
 
 	e.m.mu.Lock()
 	delete(e.m.peers, node.Name)
+	fn := e.m.onLeave
 	e.m.mu.Unlock()
 
+	if fn != nil {
+		fn(node.Name)
+	}
 	e.m.notifyChange()
 }
 

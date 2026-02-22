@@ -45,6 +45,7 @@ type Membership struct {
 	meta          atomic.Pointer[NodeMeta]
 	vivaldi       *vivaldi.Client
 	onChange      func([]PeerInfo)
+	onLeave       func(nodeID string)
 	tlsConfig     *tls.Config // stored during Start for FluiteTransport reuse
 
 	mu    sync.RWMutex
@@ -158,6 +159,15 @@ func (m *Membership) LivePeers() []PeerInfo {
 func (m *Membership) SetOnChange(fn func([]PeerInfo)) {
 	m.mu.Lock()
 	m.onChange = fn
+	m.mu.Unlock()
+}
+
+// SetOnLeave sets the callback invoked when a peer leaves the cluster
+// (graceful leave or SWIM failure detection). Extensions can use this
+// to clean up external state for dead nodes.
+func (m *Membership) SetOnLeave(fn func(nodeID string)) {
+	m.mu.Lock()
+	m.onLeave = fn
 	m.mu.Unlock()
 }
 
