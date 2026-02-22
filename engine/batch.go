@@ -38,7 +38,7 @@ func (b *LazyBuffer) Add(entry GossipEntry) {
 // Flush returns the accumulated entries and clears the buffer.
 func (b *LazyBuffer) Flush() []GossipEntry {
 	entries := b.entries
-	b.entries = b.entries[:0]
+	b.entries = nil // new backing array on next Add; old slice owned by caller
 	return entries
 }
 
