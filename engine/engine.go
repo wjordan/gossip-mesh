@@ -281,7 +281,9 @@ func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
 		// Fire-and-forget via QUIC datagram.
 		// Errors are non-fatal: peer will get it via lazy batch or repair.
 		if err := g.transport.SendDatagram(peer.Addr, msg); err != nil {
-			g.eagerFail.Add(1)
+			if n := g.eagerFail.Add(1); n == 1 || n%100 == 0 {
+				log.Printf("gossip: eager send to %s (%s) failed (#%d): %v", peer.NodeID, peer.Addr, n, err)
+			}
 		} else {
 			g.eagerSend.Add(1)
 		}
@@ -350,7 +352,9 @@ func (g *GossipEngine) sendLazyBatch(addr string, batch LazyBatch) {
 
 	stream, err := g.transport.OpenUniStream(ctx, addr)
 	if err != nil {
-		g.lazyFail.Add(1)
+		if n := g.lazyFail.Add(1); n == 1 || n%100 == 0 {
+			log.Printf("gossip: lazy send to %s failed (#%d): %v", addr, n, err)
+		}
 		return
 	}
 	defer stream.Close()
