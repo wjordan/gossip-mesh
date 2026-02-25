@@ -200,6 +200,14 @@ func (g *GossipEngine) Seen() *SeenTracker {
 	return g.seen
 }
 
+// SetInitialSeq primes both the SeenTracker and OrderedApplier for a topic.
+// Call this after bootstrap with the current manifest seq so incoming
+// messages aren't dropped as "gap too large" by the ordered applier.
+func (g *GossipEngine) SetInitialSeq(topic uint16, seq uint64) {
+	g.seen.SetTopicSeq(topic, seq)
+	g.applier.SetNextSeq(topic, seq+1) // expect the NEXT seq after current
+}
+
 // handleLocal processes a locally-produced entry.
 func (g *GossipEngine) handleLocal(entry GossipEntry) {
 	g.localEnqueue.Add(1)
