@@ -44,17 +44,21 @@ func (o *OrderedApplier) Receive(topic uint16, seq uint64, payload []byte) {
 	}
 
 	if seq > expected {
-		// Out of order — buffer if within gap limit.
 		count := seq - expected
 		if count <= uint64(o.maxGapBuffer) {
-			// Copy payload to avoid holding references to large buffers.
+			// Small gap — buffer and wait for missing entries.
 			buf := make([]byte, len(payload))
 			copy(buf, payload)
 			o.pending[topic].Store(seq, buf)
-			// Start gap timer if not already running.
 			if o.gapTimers[topic].CompareAndSwap(0, 1) {
 				go o.gapTimer(topic, expected)
 			}
+		} else {
+			// Gap too large to buffer — deliver immediately and skip ahead.
+			// The downstream consumer must handle out-of-order delivery.
+			o.deliver(topic, seq, payload)
+			o.nextSeq[topic].Store(seq + 1)
+			o.drainPending(topic)
 		}
 		return
 	}
