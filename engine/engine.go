@@ -372,12 +372,13 @@ func (g *GossipEngine) sendLazyBatch(addr string, batch LazyBatch) {
 	g.lazySend.Add(1)
 }
 
-// Eager message encoding: [2B topic BE][8B seq BE][payload...]
+// Eager message encoding: [1B type][2B topic BE][8B seq BE][payload...]
 func encodeEagerMessage(entry GossipEntry) []byte {
-	msg := make([]byte, 2+8+len(entry.Payload))
-	binary.BigEndian.PutUint16(msg[0:], entry.Topic)
-	binary.BigEndian.PutUint64(msg[2:], entry.Seq)
-	copy(msg[10:], entry.Payload)
+	msg := make([]byte, 1+2+8+len(entry.Payload))
+	msg[0] = transport.MsgTypeEagerGossip
+	binary.BigEndian.PutUint16(msg[1:], entry.Topic)
+	binary.BigEndian.PutUint64(msg[3:], entry.Seq)
+	copy(msg[11:], entry.Payload)
 	return msg
 }
 
