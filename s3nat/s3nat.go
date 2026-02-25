@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -86,8 +87,8 @@ func (e *Extension) Start(ctx context.Context, m *mesh.Mesh) error {
 	cfg := m.Config()
 
 	appPort := cfg.BindPort + 1
-	bindAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.BindPort)
-	appAddr := fmt.Sprintf("%s:%d", cfg.BindAddr, appPort)
+	bindAddr := net.JoinHostPort(cfg.BindAddr, strconv.Itoa(cfg.BindPort))
+	appAddr := net.JoinHostPort(cfg.BindAddr, strconv.Itoa(appPort))
 
 	// Register address reflection handler.
 	natutil.RegisterReflectHandler(m.Transport)

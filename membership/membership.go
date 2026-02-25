@@ -3,6 +3,8 @@ package membership
 import (
 	"crypto/tls"
 	"fmt"
+	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -201,7 +203,7 @@ func (m *Membership) LocalAddr() string {
 		return ""
 	}
 	node := m.list.LocalNode()
-	return fmt.Sprintf("%s:%d", node.Addr, node.Port)
+	return net.JoinHostPort(node.Addr.String(), strconv.Itoa(int(node.Port)))
 }
 
 // IsAlive returns true if the given node is a known alive peer.
@@ -221,7 +223,7 @@ func (m *Membership) AddrForNode(nodeID string) string {
 	if !ok || !p.Alive {
 		return ""
 	}
-	return fmt.Sprintf("%s:%d", p.Meta.QUICAddr, p.Meta.QUICPort)
+	return net.JoinHostPort(p.Meta.QUICAddr, strconv.Itoa(p.Meta.QUICPort))
 }
 
 // TLSConfig returns the mutual TLS config created during Start.

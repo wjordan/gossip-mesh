@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -155,7 +156,7 @@ func Join(cfg Config) (*Mesh, error) {
 		for i, p := range peers {
 			overlayPeers[i] = overlay.PeerInfo{
 				NodeID: p.NodeID,
-				Addr:   fmt.Sprintf("%s:%d", p.Meta.QUICAddr, p.Meta.QUICPort),
+				Addr:   net.JoinHostPort(p.Meta.QUICAddr, strconv.Itoa(p.Meta.QUICPort)),
 				RTT:    p.RTT,
 			}
 		}
