@@ -7,14 +7,30 @@ package engine
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/wjordan/gossip-mesh/overlay"
 	"github.com/wjordan/gossip-mesh/transport"
 )
+
+// EngineStats holds gossip engine counters for observability.
+type EngineStats struct {
+	EagerRecv    int64 // eager messages received
+	EagerDup     int64 // eager messages already seen (duplicates)
+	LazyRecv     int64 // lazy batch entries received
+	LazyDup      int64 // lazy entries already seen
+	LocalEnqueue int64 // locally enqueued entries
+	DeliverDrop  int64 // entries dropped because deliver channel was full
+	EagerSend    int64 // eager datagrams sent
+	EagerFail    int64 // eager datagram send failures
+	LazySend     int64 // lazy batches sent
+	LazyFail     int64 // lazy batch send failures
+}
 
 // GossipEntry is a single gossip message (page invalidation, checkpoint, etc.).
 type GossipEntry struct {
@@ -73,6 +89,43 @@ type GossipEngine struct {
 
 	// Output to SyncEngine.
 	deliverCh chan DeliveredEntry
+
+	// Observability counters.
+	eagerRecv    atomic.Int64
+	eagerDup     atomic.Int64
+	lazyRecv     atomic.Int64
+	lazyDup      atomic.Int64
+	localEnqueue atomic.Int64
+	deliverDrop  atomic.Int64
+	eagerSend    atomic.Int64
+	eagerFail    atomic.Int64
+	lazySend     atomic.Int64
+	lazyFail     atomic.Int64
+}
+
+// Stats returns a snapshot of engine counters.
+func (g *GossipEngine) Stats() EngineStats {
+	return EngineStats{
+		EagerRecv:    g.eagerRecv.Load(),
+		EagerDup:     g.eagerDup.Load(),
+		LazyRecv:     g.lazyRecv.Load(),
+		LazyDup:      g.lazyDup.Load(),
+		LocalEnqueue: g.localEnqueue.Load(),
+		DeliverDrop:  g.deliverDrop.Load(),
+		EagerSend:    g.eagerSend.Load(),
+		EagerFail:    g.eagerFail.Load(),
+		LazySend:     g.lazySend.Load(),
+		LazyFail:     g.lazyFail.Load(),
+	}
+}
+
+// StatsString returns a one-line summary of engine counters.
+func (g *GossipEngine) StatsString() string {
+	s := g.Stats()
+	return fmt.Sprintf("eager(recv=%d dup=%d send=%d fail=%d) lazy(recv=%d dup=%d send=%d fail=%d) local=%d deliverDrop=%d",
+		s.EagerRecv, s.EagerDup, s.EagerSend, s.EagerFail,
+		s.LazyRecv, s.LazyDup, s.LazySend, s.LazyFail,
+		s.LocalEnqueue, s.DeliverDrop)
 }
 
 // New creates a GossipEngine.
@@ -94,7 +147,7 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 		select {
 		case g.deliverCh <- DeliveredEntry{Topic: topic, Seq: seq, Payload: payload}:
 		default:
-			// Drop if buffer full — S3 poll fallback handles missed entries.
+			g.deliverDrop.Add(1)
 		}
 	})
 	g.applier.maxGapBuffer = cfg.MaxGapBuffer
@@ -149,6 +202,8 @@ func (g *GossipEngine) Seen() *SeenTracker {
 
 // handleLocal processes a locally-produced entry.
 func (g *GossipEngine) handleLocal(entry GossipEntry) {
+	g.localEnqueue.Add(1)
+
 	// Mark as seen.
 	g.seen.ShouldProcess(entry.Topic, entry.Seq)
 
@@ -168,8 +223,10 @@ func (g *GossipEngine) onEagerReceive(from string, data []byte) {
 	}
 
 	if !g.seen.ShouldProcess(entry.Topic, entry.Seq) {
+		g.eagerDup.Add(1)
 		return // already seen via another path
 	}
+	g.eagerRecv.Add(1)
 
 	// Deliver to SyncEngine (via ordered applier).
 	g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
@@ -200,8 +257,10 @@ func (g *GossipEngine) onLazyBatchReceive(from string, reader io.Reader) {
 	// Process each entry.
 	for _, entry := range batch.Entries {
 		if !g.seen.ShouldProcess(entry.Topic, entry.Seq) {
+			g.lazyDup.Add(1)
 			continue
 		}
+		g.lazyRecv.Add(1)
 		g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
 		// Forward to OUR eager peers (excluding sender).
 		g.eagerForward(entry, from)
@@ -221,7 +280,11 @@ func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
 		}
 		// Fire-and-forget via QUIC datagram.
 		// Errors are non-fatal: peer will get it via lazy batch or repair.
-		_ = g.transport.SendDatagram(peer.Addr, msg)
+		if err := g.transport.SendDatagram(peer.Addr, msg); err != nil {
+			g.eagerFail.Add(1)
+		} else {
+			g.eagerSend.Add(1)
+		}
 	}
 }
 
@@ -287,18 +350,22 @@ func (g *GossipEngine) sendLazyBatch(addr string, batch LazyBatch) {
 
 	stream, err := g.transport.OpenUniStream(ctx, addr)
 	if err != nil {
+		g.lazyFail.Add(1)
 		return
 	}
 	defer stream.Close()
 
 	// Write stream type prefix.
 	if _, err := stream.Write([]byte{transport.StreamTypeLazyBatch}); err != nil {
+		g.lazyFail.Add(1)
 		return
 	}
 
 	if err := WriteLazyBatch(stream, batch); err != nil {
+		g.lazyFail.Add(1)
 		return
 	}
+	g.lazySend.Add(1)
 }
 
 // Eager message encoding: [2B topic BE][8B seq BE][payload...]

@@ -6,7 +6,9 @@
 package overlay
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -355,4 +357,23 @@ func (o *Overlay) PeerCount() int {
 	o.mu.RLock()
 	defer o.mu.RUnlock()
 	return len(o.eagerPeers) + len(o.lazyPeers)
+}
+
+// Summary returns a human-readable summary of the overlay state.
+func (o *Overlay) Summary() string {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
+
+	var parts []string
+	for _, p := range o.eagerPeers {
+		parts = append(parts, fmt.Sprintf("%s(eager,%.0fms)", p.NodeID, float64(p.RTT)/float64(time.Millisecond)))
+	}
+	for _, p := range o.lazyPeers {
+		parts = append(parts, fmt.Sprintf("%s(lazy,%.0fms)", p.NodeID, float64(p.RTT)/float64(time.Millisecond)))
+	}
+	if len(parts) == 0 {
+		return "overlay: no peers"
+	}
+	return fmt.Sprintf("overlay: eager=%d lazy=%d [%s]",
+		len(o.eagerPeers), len(o.lazyPeers), strings.Join(parts, " "))
 }
