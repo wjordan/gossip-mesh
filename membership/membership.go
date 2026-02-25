@@ -116,12 +116,16 @@ func (m *Membership) Start(cfg MembershipConfig) error {
 	}
 	m.list = list
 
-	// Join seed nodes (non-fatal if no seeds — single-node cluster).
+	// Join seed nodes in the background — QUIC dials to unreachable seeds
+	// can block for the full handshake timeout, and memberlist.Join iterates
+	// seeds sequentially. Running in the background avoids blocking Start().
+	// SWIM protocol will discover peers via gossip probes regardless.
 	if len(cfg.SeedAddrs) > 0 {
-		if _, err := list.Join(cfg.SeedAddrs); err != nil {
-			// Log but don't fail — node can still operate and retry via gossip.
-			fmt.Printf("membership: join seeds failed: %v\n", err)
-		}
+		go func() {
+			if _, err := list.Join(cfg.SeedAddrs); err != nil {
+				fmt.Printf("membership: join seeds: %v\n", err)
+			}
+		}()
 	}
 
 	return nil
