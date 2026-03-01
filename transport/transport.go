@@ -174,6 +174,11 @@ func (t *Transport) OpenStream(ctx context.Context, addr string) (*quic.Stream, 
 	}
 	s, err := conn.OpenStreamSync(ctx)
 	if err != nil {
+		// Evict the connection so the next attempt re-dials fresh.
+		// A healthy connection opens streams in <1ms; if it timed out
+		// the connection is likely half-open or broken.
+		t.appConns.CompareAndDelete(addr, conn)
+		conn.CloseWithError(0, "stream open failed")
 		return nil, fmt.Errorf("open stream to %s: %w", addr, err)
 	}
 	return s, nil
@@ -187,6 +192,8 @@ func (t *Transport) OpenUniStream(ctx context.Context, addr string) (*quic.SendS
 	}
 	s, err := conn.OpenUniStreamSync(ctx)
 	if err != nil {
+		t.appConns.CompareAndDelete(addr, conn)
+		conn.CloseWithError(0, "uni stream open failed")
 		return nil, fmt.Errorf("open uni stream to %s: %w", addr, err)
 	}
 	return s, nil
