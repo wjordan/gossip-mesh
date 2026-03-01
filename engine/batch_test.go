@@ -176,7 +176,7 @@ func TestEagerMessage_RoundTrip(t *testing.T) {
 	entry := GossipEntry{Topic: 42, Seq: 12345, Payload: []byte("test-payload")}
 
 	encoded := encodeEagerMessage(entry)
-	decoded, err := decodeEagerMessage(encoded)
+	decoded, err := decodeEagerMessage(encoded[1:])
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
