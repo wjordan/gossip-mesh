@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -90,9 +91,11 @@ func New(cfg Config) (*Transport, error) {
 	tlsConf.NextProtos = []string{alpn}
 
 	quicConf := &quic.Config{
-		MaxIdleTimeout:  30_000_000_000, // 30s
-		KeepAlivePeriod: 10_000_000_000, // 10s
-		EnableDatagrams: true,
+		MaxIdleTimeout:       30_000_000_000, // 30s
+		KeepAlivePeriod:      10_000_000_000, // 10s
+		EnableDatagrams:      true,
+		MaxIncomingStreams:    1000,
+		MaxIncomingUniStreams: 1000,
 	}
 
 	udpAddr := &net.UDPAddr{
@@ -167,18 +170,26 @@ func (t *Transport) SendDatagram(addr string, payload []byte) error {
 func (t *Transport) OpenStream(ctx context.Context, addr string) (*quic.Stream, error) {
 	conn, err := t.getOrDial(ctx, addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
-	return conn.OpenStreamSync(ctx)
+	s, err := conn.OpenStreamSync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open stream to %s: %w", addr, err)
+	}
+	return s, nil
 }
 
 // OpenUniStream opens a unidirectional send stream to addr.
 func (t *Transport) OpenUniStream(ctx context.Context, addr string) (*quic.SendStream, error) {
 	conn, err := t.getOrDial(ctx, addr)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
-	return conn.OpenUniStreamSync(ctx)
+	s, err := conn.OpenUniStreamSync(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open uni stream to %s: %w", addr, err)
+	}
+	return s, nil
 }
 
 // GetConnection returns an existing application connection to addr, or nil.
@@ -377,6 +388,8 @@ func (t *Transport) dispatchBidiStream(from string, stream *quic.Stream) {
 	case StreamTypeRepair:
 		if t.OnRepair != nil {
 			t.OnRepair(from, stream)
+		} else {
+			stream.Close()
 		}
 	case MsgTypeEagerGossip:
 		// Eager gossip can also arrive as a short-lived bidi stream

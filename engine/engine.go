@@ -279,9 +279,9 @@ func (g *GossipEngine) onLazyBatchReceive(from string, reader io.Reader) {
 
 // eagerForward sends an entry to all eager peers (except excludeNodeID).
 func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
-	msg := encodeEagerMessage(entry)
 	peers := g.overlay.EagerPeers()
 
+	msg := encodeEagerMessage(entry)
 	for _, peer := range peers {
 		if peer.NodeID == excludeNodeID {
 			continue
