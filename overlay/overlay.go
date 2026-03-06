@@ -197,14 +197,18 @@ func (o *Overlay) selectEager(peers []PeerInfo) []bool {
 		if gapIdx > o.cfg.MaxEagerPeers {
 			gapIdx = o.cfg.MaxEagerPeers
 		}
-		if len(peers)-gapIdx < o.cfg.MinLazyPeers {
+		// Cap to available peers before enforcing MinLazyPeers.
+		if gapIdx > len(peers) {
+			gapIdx = len(peers)
+		}
+		// Enforce MinLazyPeers only when there are enough total peers
+		// for both constraints. In small clusters (≤ MinEager+MinLazy),
+		// prefer eager delivery for lower latency.
+		if len(peers)-gapIdx < o.cfg.MinLazyPeers && len(peers) > o.cfg.MinEagerPeers+o.cfg.MinLazyPeers {
 			gapIdx = len(peers) - o.cfg.MinLazyPeers
 		}
 		if gapIdx < 0 {
 			gapIdx = 0
-		}
-		if gapIdx > len(peers) {
-			gapIdx = len(peers)
 		}
 		for i := 0; i < gapIdx; i++ {
 			isEager[i] = true

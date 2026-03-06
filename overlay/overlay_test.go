@@ -186,6 +186,51 @@ func TestOverlay_Reclassify_Empty(t *testing.T) {
 	}
 }
 
+// TestOverlay_Reclassify_SmallCluster verifies that small clusters (fewer
+// peers than MinEagerPeers+MinLazyPeers) classify all peers as eager.
+// This is the exact scenario in a 2-node deployment: 1 peer should be eager,
+// not lazy. Without this fix, MinLazyPeers overrides MinEagerPeers and
+// produces 0 eager peers → all lazy → no immediate gossip delivery.
+func TestOverlay_Reclassify_SmallCluster(t *testing.T) {
+	o := New("self", OverlayConfig{}) // defaults: MinEager=4, MinLazy=2
+
+	tests := []struct {
+		name         string
+		peerCount    int
+		wantMinEager int // at least this many eager
+	}{
+		{"1 peer", 1, 1},   // was 0 before fix
+		{"2 peers", 2, 2},  // was 0 before fix
+		{"3 peers", 3, 3},  // was 0 before fix
+		{"4 peers", 4, 4},  // was 0 before fix
+		{"5 peers", 5, 4},  // MinEagerPeers satisfied
+		{"6 peers", 6, 4},  // MinEagerPeers satisfied
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peers := make([]PeerInfo, tt.peerCount)
+			for i := range peers {
+				peers[i] = PeerInfo{
+					NodeID: fmt.Sprintf("n%d", i),
+					RTT:    time.Duration(i+1) * time.Millisecond,
+				}
+			}
+
+			o.Reclassify(peers)
+
+			eager := len(o.EagerPeers())
+			lazy := len(o.LazyPeers())
+			if eager < tt.wantMinEager {
+				t.Fatalf("got eager=%d lazy=%d, want at least eager=%d", eager, lazy, tt.wantMinEager)
+			}
+			if eager+lazy != tt.peerCount {
+				t.Fatalf("total=%d, want %d", eager+lazy, tt.peerCount)
+			}
+		})
+	}
+}
+
 func TestOverlay_Reclassify_MinConstraints(t *testing.T) {
 	o := New("self", OverlayConfig{
 		MinEagerPeers: 3,
