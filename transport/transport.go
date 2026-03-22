@@ -39,17 +39,51 @@ type Transport struct {
 	shutdownCh chan struct{}
 	wg         sync.WaitGroup
 
-	// Handlers for inbound traffic, set by the gossip engine before
-	// calling StartAcceptLoopAll.
-	OnEagerGossip func(from string, data []byte)
-	OnLazyBatch   func(from string, reader io.Reader)
-	OnRepair      func(from string, stream *quic.Stream)
+	// Handlers for inbound traffic, set by the gossip engine via SetHandlers.
+	onEagerGossip func(from string, data []byte)
+	onLazyBatch   func(from string, reader io.Reader)
+	onRepair      func(from string, stream *quic.Stream)
 
 	// Extensible handler registries for application-defined stream types.
 	bidiHandlers     map[byte]BidiHandler
 	uniHandlers      map[byte]UniHandler
 	datagramHandlers map[byte]DatagramHandler
 	handlerMu        sync.RWMutex
+}
+
+// SetHandlers atomically sets the gossip protocol handlers. Safe to call
+// concurrently with transport goroutines reading these handlers.
+func (t *Transport) SetHandlers(
+	eager func(from string, data []byte),
+	lazy func(from string, reader io.Reader),
+	repair func(from string, stream *quic.Stream),
+) {
+	t.handlerMu.Lock()
+	t.onEagerGossip = eager
+	t.onLazyBatch = lazy
+	t.onRepair = repair
+	t.handlerMu.Unlock()
+}
+
+func (t *Transport) getEagerGossip() func(from string, data []byte) {
+	t.handlerMu.RLock()
+	h := t.onEagerGossip
+	t.handlerMu.RUnlock()
+	return h
+}
+
+func (t *Transport) getLazyBatch() func(from string, reader io.Reader) {
+	t.handlerMu.RLock()
+	h := t.onLazyBatch
+	t.handlerMu.RUnlock()
+	return h
+}
+
+func (t *Transport) getRepair() func(from string, stream *quic.Stream) {
+	t.handlerMu.RLock()
+	h := t.onRepair
+	t.handlerMu.RUnlock()
+	return h
 }
 
 // Config configures the application-level QUIC transport.
@@ -369,8 +403,8 @@ func (t *Transport) receiveDatagrams(conn *quic.Conn) {
 		}
 		switch msg[0] {
 		case MsgTypeEagerGossip:
-			if t.OnEagerGossip != nil {
-				t.OnEagerGossip(from, msg[1:])
+			if h := t.getEagerGossip(); h != nil {
+				h(from, msg[1:])
 			}
 		default:
 			t.handlerMu.RLock()
@@ -393,18 +427,18 @@ func (t *Transport) dispatchBidiStream(from string, stream *quic.Stream) {
 	}
 	switch typeBuf[0] {
 	case StreamTypeRepair:
-		if t.OnRepair != nil {
-			t.OnRepair(from, stream)
+		if h := t.getRepair(); h != nil {
+			h(from, stream)
 		} else {
 			stream.Close()
 		}
 	case MsgTypeEagerGossip:
 		// Eager gossip can also arrive as a short-lived bidi stream
 		// (fallback when datagrams are unavailable or payload too large).
-		if t.OnEagerGossip != nil {
+		if h := t.getEagerGossip(); h != nil {
 			data, err := io.ReadAll(stream)
 			if err == nil {
-				t.OnEagerGossip(from, data)
+				h(from, data)
 			}
 		}
 		stream.Close()
@@ -428,8 +462,8 @@ func (t *Transport) dispatchUniStream(from string, stream *quic.ReceiveStream) {
 	}
 	switch typeBuf[0] {
 	case StreamTypeLazyBatch:
-		if t.OnLazyBatch != nil {
-			t.OnLazyBatch(from, stream)
+		if h := t.getLazyBatch(); h != nil {
+			h(from, stream)
 		}
 	default:
 		t.handlerMu.RLock()

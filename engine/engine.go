@@ -155,9 +155,9 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 
 	g.repair = NewRepairManager(o, t, g.applier)
 
-	// Register transport handlers.
-	t.OnEagerGossip = g.onEagerReceive
-	t.OnLazyBatch = g.onLazyBatchReceive
+	// Register transport handlers (synchronized to avoid races with
+	// transport goroutines that may already be running).
+	t.SetHandlers(g.onEagerReceive, g.onLazyBatchReceive, nil)
 
 	return g
 }

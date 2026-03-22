@@ -133,8 +133,17 @@ func (m *Membership) Start(cfg MembershipConfig) error {
 
 // Stop gracefully leaves the cluster and shuts down.
 func (m *Membership) Stop() error {
+	return m.StopWithTimeout(0)
+}
+
+// StopWithTimeout is like Stop but with an explicit leave timeout.
+// Use 0 for the default (1s, sufficient for LAN/localhost clusters).
+func (m *Membership) StopWithTimeout(leaveTimeout time.Duration) error {
+	if leaveTimeout <= 0 {
+		leaveTimeout = 1 * time.Second
+	}
 	if m.list != nil {
-		if err := m.list.Leave(5 * time.Second); err != nil {
+		if err := m.list.Leave(leaveTimeout); err != nil {
 			return fmt.Errorf("leave: %w", err)
 		}
 		if err := m.list.Shutdown(); err != nil {
@@ -189,7 +198,10 @@ func (m *Membership) UpdateMeta(fn func(*NodeMeta)) {
 		}
 	}
 	if m.list != nil {
-		m.list.UpdateNode(0)
+		// Use a short timeout so this doesn't block forever if
+		// memberlist is shutting down (internal channels may be full
+		// with no consumer).
+		m.list.UpdateNode(500 * time.Millisecond)
 	}
 }
 
