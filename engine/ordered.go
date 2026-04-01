@@ -21,6 +21,10 @@ type OrderedApplier struct {
 	// Active gap timers — one per slot. We track them to avoid spawning
 	// duplicate timers.
 	gapTimers [maxSlots]atomic.Int32 // 1 = timer active, 0 = idle
+
+	// onGap is called when a gap times out, before skipping ahead.
+	// Returns true if the gap was filled (e.g., via repair pull).
+	onGap func(topic uint16, seq uint64) bool
 }
 
 // NewOrderedApplier creates an OrderedApplier that calls deliver for
@@ -89,7 +93,10 @@ func (o *OrderedApplier) gapTimer(topic uint16, expectedAtStart uint64) {
 
 	current := o.nextSeq[topic].Load()
 	if current == expectedAtStart {
-		// Gap not filled — skip ahead to next available.
+		// Gap not filled — attempt repair before skipping.
+		if o.onGap != nil && o.onGap(topic, current) {
+			return
+		}
 		o.skipGap(topic)
 	}
 }

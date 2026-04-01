@@ -42,7 +42,7 @@ type Transport struct {
 	// Handlers for inbound traffic, set by the gossip engine via SetHandlers.
 	onEagerGossip func(from string, data []byte)
 	onLazyBatch   func(from string, reader io.Reader)
-	onRepair      func(from string, stream *quic.Stream)
+	onRepair      func(from string, stream io.ReadWriteCloser)
 
 	// Extensible handler registries for application-defined stream types.
 	bidiHandlers     map[byte]BidiHandler
@@ -56,7 +56,7 @@ type Transport struct {
 func (t *Transport) SetHandlers(
 	eager func(from string, data []byte),
 	lazy func(from string, reader io.Reader),
-	repair func(from string, stream *quic.Stream),
+	repair func(from string, stream io.ReadWriteCloser),
 ) {
 	t.handlerMu.Lock()
 	t.onEagerGossip = eager
@@ -79,7 +79,7 @@ func (t *Transport) getLazyBatch() func(from string, reader io.Reader) {
 	return h
 }
 
-func (t *Transport) getRepair() func(from string, stream *quic.Stream) {
+func (t *Transport) getRepair() func(from string, stream io.ReadWriteCloser) {
 	t.handlerMu.RLock()
 	h := t.onRepair
 	t.handlerMu.RUnlock()

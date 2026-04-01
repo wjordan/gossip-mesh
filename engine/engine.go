@@ -1,7 +1,8 @@
 // Package engine implements the Plumtree-inspired gossip event loop for
 // page invalidation dissemination. It replaces NATS pub/sub with two-tier
-// gossip: eager peers receive immediate QUIC datagram/stream pushes, lazy
-// peers receive batched QUIC stream deliveries.
+// gossip: eager peers receive immediate QUIC datagram pushes, lazy peers
+// receive batched QUIC stream deliveries. Lost datagrams are recovered
+// via pull-based repair when a gap is detected.
 package engine
 
 import (
@@ -155,9 +156,14 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 
 	g.repair = NewRepairManager(o, t, g.applier)
 
+	// Attempt repair before the ordered applier skips a gap.
+	g.applier.onGap = func(topic uint16, seq uint64) bool {
+		return g.repair.RequestRepair(topic, seq)
+	}
+
 	// Register transport handlers (synchronized to avoid races with
 	// transport goroutines that may already be running).
-	t.SetHandlers(g.onEagerReceive, g.onLazyBatchReceive, nil)
+	t.SetHandlers(g.onEagerReceive, g.onLazyBatchReceive, g.repair.HandleRequest)
 
 	return g
 }
@@ -212,8 +218,9 @@ func (g *GossipEngine) SetInitialSeq(topic uint16, seq uint64) {
 func (g *GossipEngine) handleLocal(entry GossipEntry) {
 	g.localEnqueue.Add(1)
 
-	// Mark as seen.
+	// Mark as seen and cache for repair serving.
 	g.seen.ShouldProcess(entry.Topic, entry.Seq)
+	g.repair.CacheEntry(entry)
 
 	// Eager forward to all eager peers.
 	g.eagerForward(entry, "")
@@ -235,6 +242,7 @@ func (g *GossipEngine) onEagerReceive(from string, data []byte) {
 		return // already seen via another path
 	}
 	g.eagerRecv.Add(1)
+	g.repair.CacheEntry(entry)
 
 	// Deliver to SyncEngine (via ordered applier).
 	g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
@@ -269,6 +277,7 @@ func (g *GossipEngine) onLazyBatchReceive(from string, reader io.Reader) {
 			continue
 		}
 		g.lazyRecv.Add(1)
+		g.repair.CacheEntry(entry)
 		g.applier.Receive(entry.Topic, entry.Seq, entry.Payload)
 		// Forward to OUR eager peers (excluding sender).
 		g.eagerForward(entry, from)
