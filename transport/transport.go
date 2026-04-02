@@ -128,8 +128,8 @@ func New(cfg Config) (*Transport, error) {
 		MaxIdleTimeout:       30_000_000_000, // 30s
 		KeepAlivePeriod:      10_000_000_000, // 10s
 		EnableDatagrams:      true,
-		MaxIncomingStreams:    1000,
-		MaxIncomingUniStreams: 1000,
+		MaxIncomingStreams:    100_000,
+		MaxIncomingUniStreams: 100_000,
 	}
 
 	udpAddr := &net.UDPAddr{
