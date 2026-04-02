@@ -57,10 +57,10 @@ type Membership struct {
 // Start creates the QUIC transport, initializes memberlist, and joins seed nodes.
 func (m *Membership) Start(cfg MembershipConfig) error {
 	if cfg.ProbeInterval == 0 {
-		cfg.ProbeInterval = 500 * time.Millisecond
+		cfg.ProbeInterval = 1000 * time.Millisecond
 	}
 	if cfg.ProbeTimeout == 0 {
-		cfg.ProbeTimeout = 250 * time.Millisecond
+		cfg.ProbeTimeout = 500 * time.Millisecond
 	}
 	if cfg.SuspicionMult == 0 {
 		cfg.SuspicionMult = 3
@@ -105,6 +105,11 @@ func (m *Membership) Start(cfg MembershipConfig) error {
 	mlCfg.ProbeInterval = cfg.ProbeInterval
 	mlCfg.ProbeTimeout = cfg.ProbeTimeout
 	mlCfg.SuspicionMult = cfg.SuspicionMult
+	// Disable TCP fallback pings. Memberlist opens a stream (TCP-equivalent)
+	// for every UDP probe that times out. With cross-region peers at 200ms+
+	// RTT and a 250ms ProbeTimeout, this triggers constantly and exhausts
+	// QUIC stream IDs. QUIC datagrams already provide reliable UDP probing.
+	mlCfg.DisableTcpPings = true
 	mlCfg.Delegate = &delegate{meta: &m.meta}
 	mlCfg.Events = &eventDelegate{m: m}
 	mlCfg.Ping = &pingDelegate{m: m}
