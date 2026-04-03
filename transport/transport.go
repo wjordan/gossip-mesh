@@ -420,6 +420,11 @@ func (t *Transport) receiveDatagrams(conn *quic.Conn) {
 }
 
 func (t *Transport) dispatchBidiStream(from string, stream *quic.Stream) {
+	// CancelRead ensures the receive side is released even if the handler
+	// doesn't read to EOF. Without this, quic-go retains stream objects
+	// in incomingStreamsMap indefinitely.
+	defer stream.CancelRead(0)
+
 	var typeBuf [1]byte
 	if _, err := io.ReadFull(stream, typeBuf[:]); err != nil {
 		stream.Close()
@@ -456,6 +461,8 @@ func (t *Transport) dispatchBidiStream(from string, stream *quic.Stream) {
 }
 
 func (t *Transport) dispatchUniStream(from string, stream *quic.ReceiveStream) {
+	defer stream.CancelRead(0) // release stream so quic-go can reclaim it
+
 	var typeBuf [1]byte
 	if _, err := io.ReadFull(stream, typeBuf[:]); err != nil {
 		return
