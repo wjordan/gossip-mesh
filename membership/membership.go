@@ -110,11 +110,6 @@ func (m *Membership) Start(cfg MembershipConfig) error {
 	// RTT and a 250ms ProbeTimeout, this triggers constantly and exhausts
 	// QUIC stream IDs. QUIC datagrams already provide reliable UDP probing.
 	mlCfg.DisableTcpPings = true
-	// Disable LZW compression. Memberlist allocates a fresh lzw.Writer/Reader
-	// for every message (~4KB+ each). With hundreds of protocol messages per
-	// second, this creates GB of allocation churn and transient memory spikes.
-	// QUIC already provides transport-level compression via TLS.
-	mlCfg.EnableCompression = false
 	mlCfg.Delegate = &delegate{meta: &m.meta}
 	mlCfg.Events = &eventDelegate{m: m}
 	mlCfg.Ping = &pingDelegate{m: m}
