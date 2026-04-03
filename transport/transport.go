@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	memberlistquic "github.com/wjordan/memberlist-quic"
 
@@ -37,6 +38,7 @@ type Transport struct {
 	logger     *log.Logger
 
 	shutdownCh chan struct{}
+	closed     atomic.Bool
 	wg         sync.WaitGroup
 
 	// Handlers for inbound traffic, set by the gossip engine via SetHandlers.
@@ -265,6 +267,7 @@ func (t *Transport) QUICTransport() *quic.Transport {
 
 // Shutdown closes the transport and waits for goroutines to finish.
 func (t *Transport) Shutdown() error {
+	t.closed.Store(true)
 	close(t.shutdownCh)
 	t.listener.Close()
 	t.appConns.Range(func(key, value any) bool {
@@ -346,6 +349,9 @@ func (t *Transport) acceptLoop() {
 // unidirectional streams, and datagrams on a connection, dispatching
 // each to the appropriate handler based on the first type byte.
 func (t *Transport) startAcceptLoop(conn *quic.Conn) {
+	if t.closed.Load() {
+		return
+	}
 	t.wg.Add(3)
 	go t.acceptBidiStreams(conn)
 	go t.acceptUniStreams(conn)
