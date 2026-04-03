@@ -87,9 +87,10 @@ func (m *Membership) Start(cfg MembershipConfig) error {
 
 	// Create QUIC transport.
 	qt, err := memberlistquic.New(memberlistquic.Config{
-		BindAddr: cfg.BindAddr,
-		BindPort: cfg.BindPort,
-		TLS:      cfg.TLS,
+		BindAddr:         cfg.BindAddr,
+		BindPort:         cfg.BindPort,
+		TLS:              cfg.TLS,
+		MaxConnectionAge: 10 * time.Minute, // recycle connections to free accumulated stream objects
 	})
 	if err != nil {
 		return fmt.Errorf("create QUIC transport: %w", err)
