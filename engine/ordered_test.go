@@ -166,6 +166,52 @@ func TestOrderedApplier_SetNextSeq_ClearsPending(t *testing.T) {
 	}
 }
 
+func TestOrderedApplier_SecondaryGapAfterSkip(t *testing.T) {
+	// Regression test: after skipGap drains pending and hits a secondary gap,
+	// entries beyond the second gap must eventually be delivered (not stranded).
+	var delivered []uint64
+	var mu sync.Mutex
+
+	oa := NewOrderedApplier(func(topic uint16, seq uint64, payload []byte) {
+		mu.Lock()
+		delivered = append(delivered, seq)
+		mu.Unlock()
+	})
+	oa.gapTimeout = 50 * time.Millisecond
+	oa.SetNextSeq(0, 1)
+
+	// Buffer seq 3 and seq 7 (two gaps: missing 1-2 and 4-6).
+	oa.Receive(0, 3, []byte("c"))
+	oa.Receive(0, 7, []byte("g"))
+
+	// Wait for first gap timeout to fire and skip to seq 3.
+	// drainPending delivers 3, then hits secondary gap at 4-6.
+	// The fix ensures a new gap timer starts for seq 7.
+	time.Sleep(80 * time.Millisecond)
+
+	mu.Lock()
+	if len(delivered) != 1 || delivered[0] != 3 {
+		mu.Unlock()
+		t.Fatalf("after first gap timeout: expected [3], got %v", delivered)
+	}
+	mu.Unlock()
+
+	// Wait for second gap timeout to fire and skip to seq 7.
+	time.Sleep(80 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(delivered) != 2 {
+		t.Fatalf("expected 2 deliveries after both gap timeouts, got %d: %v", len(delivered), delivered)
+	}
+	if delivered[1] != 7 {
+		t.Fatalf("expected second delivery to be seq 7, got %d", delivered[1])
+	}
+	if oa.NextSeq(0) != 8 {
+		t.Fatalf("expected nextSeq=8, got %d", oa.NextSeq(0))
+	}
+}
+
 func TestOrderedApplier_PayloadPreserved(t *testing.T) {
 	var got []byte
 	oa := NewOrderedApplier(func(topic uint16, seq uint64, payload []byte) {

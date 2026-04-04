@@ -74,6 +74,8 @@ func (o *OrderedApplier) Receive(topic uint16, seq uint64, payload []byte) {
 }
 
 // drainPending delivers consecutive buffered entries starting from nextSeq.
+// If entries remain in pending after draining (secondary gap), a new gap
+// timer is started so those entries aren't stranded forever.
 func (o *OrderedApplier) drainPending(topic uint16) {
 	for {
 		next := o.nextSeq[topic].Load()
@@ -84,12 +86,27 @@ func (o *OrderedApplier) drainPending(topic uint16) {
 		o.deliver(topic, next, val.([]byte))
 		o.nextSeq[topic].Add(1)
 	}
+	// If there are still pending entries, we have a new gap that needs a timer.
+	hasPending := false
+	o.pending[topic].Range(func(_, _ any) bool {
+		hasPending = true
+		return false // stop after first
+	})
+	if hasPending {
+		expected := o.nextSeq[topic].Load()
+		if o.gapTimers[topic].CompareAndSwap(0, 1) {
+			go o.gapTimer(topic, expected)
+		}
+	}
 }
 
 // gapTimer waits for gapTimeout and then skips the gap if it wasn't filled.
 func (o *OrderedApplier) gapTimer(topic uint16, expectedAtStart uint64) {
-	defer o.gapTimers[topic].Store(0)
 	time.Sleep(o.gapTimeout)
+
+	// Clear the timer flag BEFORE skipGap so that drainPending can start
+	// a new timer if a secondary gap is discovered.
+	o.gapTimers[topic].Store(0)
 
 	current := o.nextSeq[topic].Load()
 	if current == expectedAtStart {

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/wjordan/gossip-mesh/overlay"
 	"github.com/wjordan/gossip-mesh/transport"
 )
@@ -88,6 +89,10 @@ type GossipEngine struct {
 	lazyMu      sync.Mutex
 	lazyBuffers map[string]*LazyBuffer // nodeID → buffer
 
+	// Persistent eager streams for oversized payloads (per peer addr).
+	eagerStreamMu sync.Mutex
+	eagerStreams   map[string]*eagerStreamWriter // addr → writer
+
 	// Output to SyncEngine.
 	deliverCh chan DeliveredEntry
 
@@ -134,13 +139,14 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 	cfg.withDefaults()
 
 	g := &GossipEngine{
-		overlay:     o,
-		transport:   t,
-		seen:        &SeenTracker{},
-		cfg:         cfg,
-		localCh:     make(chan GossipEntry, 256),
-		lazyBuffers: make(map[string]*LazyBuffer),
-		deliverCh:   make(chan DeliveredEntry, cfg.DeliverBufferSize),
+		overlay:      o,
+		transport:    t,
+		seen:         &SeenTracker{},
+		cfg:          cfg,
+		localCh:      make(chan GossipEntry, 256),
+		lazyBuffers:  make(map[string]*LazyBuffer),
+		eagerStreams: make(map[string]*eagerStreamWriter),
+		deliverCh:    make(chan DeliveredEntry, cfg.DeliverBufferSize),
 	}
 
 	// Create ordered applier that delivers to the output channel.
@@ -164,6 +170,13 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 	// Register transport handlers (synchronized to avoid races with
 	// transport goroutines that may already be running).
 	t.SetHandlers(g.onEagerReceive, g.onLazyBatchReceive, g.repair.HandleRequest)
+
+	// Register persistent eager stream handler for oversized payloads.
+	// Messages arrive length-prefixed on a long-lived uni-stream and are
+	// dispatched to the same onEagerReceive handler as datagrams.
+	t.RegisterUniHandler(StreamTypeEagerStream, func(from string, stream *quic.ReceiveStream) {
+		receiveEagerStream(stream, g.onEagerReceive, from)
+	})
 
 	return g
 }
@@ -287,24 +300,49 @@ func (g *GossipEngine) onLazyBatchReceive(from string, reader io.Reader) {
 }
 
 // eagerForward sends an entry to all eager peers (except excludeNodeID).
+// Small payloads use fire-and-forget datagrams. Large payloads (exceeding
+// the QUIC datagram MTU) use a persistent per-peer uni-stream that avoids
+// the overhead of opening a new stream per message.
 func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
 	peers := g.overlay.EagerPeers()
 
 	msg := encodeEagerMessage(entry)
+	useStream := len(msg) > maxDatagramPayload
 	for _, peer := range peers {
 		if peer.NodeID == excludeNodeID {
 			continue
 		}
-		// Fire-and-forget via QUIC datagram.
-		// Errors are non-fatal: peer will get it via lazy batch or repair.
-		if err := g.transport.SendDatagram(peer.Addr, msg); err != nil {
-			if n := g.eagerFail.Add(1); n == 1 || n%100 == 0 {
-				log.Printf("gossip: eager send to %s (%s) failed (#%d): %v", peer.NodeID, peer.Addr, n, err)
+		if useStream {
+			if err := g.getEagerStream(peer.Addr).send(msg); err != nil {
+				if n := g.eagerFail.Add(1); n == 1 || n%100 == 0 {
+					log.Printf("gossip: eager stream send to %s (%s) failed (#%d): %v", peer.NodeID, peer.Addr, n, err)
+				}
+			} else {
+				g.eagerSend.Add(1)
 			}
 		} else {
-			g.eagerSend.Add(1)
+			if err := g.transport.SendDatagram(peer.Addr, msg); err != nil {
+				if n := g.eagerFail.Add(1); n == 1 || n%100 == 0 {
+					log.Printf("gossip: eager send to %s (%s) failed (#%d): %v", peer.NodeID, peer.Addr, n, err)
+				}
+			} else {
+				g.eagerSend.Add(1)
+			}
 		}
 	}
+}
+
+// getEagerStream returns the persistent eager stream writer for the given
+// peer address, creating one if it doesn't exist.
+func (g *GossipEngine) getEagerStream(addr string) *eagerStreamWriter {
+	g.eagerStreamMu.Lock()
+	defer g.eagerStreamMu.Unlock()
+	w, ok := g.eagerStreams[addr]
+	if !ok {
+		w = &eagerStreamWriter{transport: g.transport, addr: addr}
+		g.eagerStreams[addr] = w
+	}
+	return w
 }
 
 // enqueueForLazy adds an entry to lazy buffers for all lazy peers
