@@ -28,10 +28,15 @@ type EngineStats struct {
 	LazyDup      int64 // lazy entries already seen
 	LocalEnqueue int64 // locally enqueued entries
 	DeliverDrop  int64 // entries dropped because deliver channel was full
+	DeliverCount int64 // entries successfully delivered to consumer
 	EagerSend    int64 // eager datagrams sent
 	EagerFail    int64 // eager datagram send failures
 	LazySend     int64 // lazy batches sent
 	LazyFail     int64 // lazy batch send failures
+	// Wire-level byte counters (transport payload, before QUIC framing).
+	EagerBytesSent int64 // eager datagram + stream bytes out
+	LazyBytesSent  int64 // lazy batch bytes out (compressed)
+	BytesRecv      int64 // all gossip bytes received (eager + lazy)
 }
 
 // GossipEntry is a single gossip message (page invalidation, checkpoint, etc.).
@@ -95,6 +100,7 @@ type GossipEngine struct {
 
 	// Output to SyncEngine.
 	deliverCh chan DeliveredEntry
+	done      chan struct{} // closed when Run exits
 
 	// Observability counters.
 	eagerRecv    atomic.Int64
@@ -103,10 +109,14 @@ type GossipEngine struct {
 	lazyDup      atomic.Int64
 	localEnqueue atomic.Int64
 	deliverDrop  atomic.Int64
+	deliverCount atomic.Int64 // messages successfully delivered to consumer
 	eagerSend    atomic.Int64
 	eagerFail    atomic.Int64
 	lazySend     atomic.Int64
 	lazyFail     atomic.Int64
+	eagerBytesSent atomic.Int64
+	lazyBytesSent  atomic.Int64
+	bytesRecv      atomic.Int64
 }
 
 // Stats returns a snapshot of engine counters.
@@ -118,20 +128,24 @@ func (g *GossipEngine) Stats() EngineStats {
 		LazyDup:      g.lazyDup.Load(),
 		LocalEnqueue: g.localEnqueue.Load(),
 		DeliverDrop:  g.deliverDrop.Load(),
-		EagerSend:    g.eagerSend.Load(),
-		EagerFail:    g.eagerFail.Load(),
-		LazySend:     g.lazySend.Load(),
-		LazyFail:     g.lazyFail.Load(),
+		DeliverCount: g.deliverCount.Load(),
+		EagerSend:      g.eagerSend.Load(),
+		EagerFail:      g.eagerFail.Load(),
+		LazySend:       g.lazySend.Load(),
+		LazyFail:       g.lazyFail.Load(),
+		EagerBytesSent: g.eagerBytesSent.Load(),
+		LazyBytesSent:  g.lazyBytesSent.Load(),
+		BytesRecv:      g.bytesRecv.Load(),
 	}
 }
 
 // StatsString returns a one-line summary of engine counters.
 func (g *GossipEngine) StatsString() string {
 	s := g.Stats()
-	return fmt.Sprintf("eager(recv=%d dup=%d send=%d fail=%d) lazy(recv=%d dup=%d send=%d fail=%d) local=%d deliverDrop=%d",
-		s.EagerRecv, s.EagerDup, s.EagerSend, s.EagerFail,
-		s.LazyRecv, s.LazyDup, s.LazySend, s.LazyFail,
-		s.LocalEnqueue, s.DeliverDrop)
+	return fmt.Sprintf("eager(recv=%d dup=%d send=%d fail=%d %dKB) lazy(recv=%d dup=%d send=%d fail=%d %dKB) local=%d deliverDrop=%d recv=%dKB",
+		s.EagerRecv, s.EagerDup, s.EagerSend, s.EagerFail, s.EagerBytesSent/1024,
+		s.LazyRecv, s.LazyDup, s.LazySend, s.LazyFail, s.LazyBytesSent/1024,
+		s.LocalEnqueue, s.DeliverDrop, s.BytesRecv/1024)
 }
 
 // New creates a GossipEngine.
@@ -147,12 +161,18 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 		lazyBuffers:  make(map[string]*LazyBuffer),
 		eagerStreams: make(map[string]*eagerStreamWriter),
 		deliverCh:    make(chan DeliveredEntry, cfg.DeliverBufferSize),
+		done:         make(chan struct{}),
 	}
 
 	// Create ordered applier that delivers to the output channel.
+	// Non-blocking: if the consumer is slow (page fetch, rebase), entries
+	// are dropped. The stream publisher's periodic full ticks recover
+	// any dropped transient updates. Blocking here would stall the entire
+	// gossip pipeline (QUIC handlers, eager forward, Enqueue).
 	g.applier = NewOrderedApplier(func(topic uint16, seq uint64, payload []byte) {
 		select {
 		case g.deliverCh <- DeliveredEntry{Topic: topic, Seq: seq, Payload: payload}:
+			g.deliverCount.Add(1)
 		default:
 			g.deliverDrop.Add(1)
 		}
@@ -183,6 +203,7 @@ func New(o *overlay.Overlay, t *transport.Transport, cfg EngineConfig) *GossipEn
 
 // Run starts the gossip engine event loop. Blocks until ctx is cancelled.
 func (g *GossipEngine) Run(ctx context.Context) {
+	defer close(g.done)
 	lazyTick := time.NewTicker(g.cfg.LazyBatchInterval)
 	defer lazyTick.Stop()
 
@@ -201,6 +222,7 @@ func (g *GossipEngine) Run(ctx context.Context) {
 }
 
 // Enqueue submits a local invalidation for gossip dissemination.
+// Blocks if the internal buffer is full (backpressure from peers).
 func (g *GossipEngine) Enqueue(topic uint16, seq uint64, payload []byte) {
 	g.localCh <- GossipEntry{
 		Topic:   topic,
@@ -245,6 +267,7 @@ func (g *GossipEngine) handleLocal(entry GossipEntry) {
 // onEagerReceive is called by Transport when an eager gossip
 // message arrives.
 func (g *GossipEngine) onEagerReceive(from string, data []byte) {
+	g.bytesRecv.Add(int64(len(data)))
 	entry, err := decodeEagerMessage(data)
 	if err != nil {
 		return
@@ -319,6 +342,7 @@ func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
 				}
 			} else {
 				g.eagerSend.Add(1)
+				g.eagerBytesSent.Add(int64(len(msg) + 5)) // +1 type +4 length header
 			}
 		} else {
 			if err := g.transport.SendDatagram(peer.Addr, msg); err != nil {
@@ -327,6 +351,7 @@ func (g *GossipEngine) eagerForward(entry GossipEntry, excludeNodeID string) {
 				}
 			} else {
 				g.eagerSend.Add(1)
+				g.eagerBytesSent.Add(int64(len(msg)))
 			}
 		}
 	}
@@ -420,11 +445,23 @@ func (g *GossipEngine) sendLazyBatch(addr string, batch LazyBatch) {
 		return
 	}
 
-	if err := WriteLazyBatch(stream, batch); err != nil {
+	compressed, err := EncodeLazyBatch(batch)
+	if err != nil {
+		g.lazyFail.Add(1)
+		return
+	}
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(compressed)))
+	if _, err := stream.Write(lenBuf[:]); err != nil {
+		g.lazyFail.Add(1)
+		return
+	}
+	if _, err := stream.Write(compressed); err != nil {
 		g.lazyFail.Add(1)
 		return
 	}
 	g.lazySend.Add(1)
+	g.lazyBytesSent.Add(int64(1 + 4 + len(compressed))) // type + length + data
 }
 
 // Eager message encoding: [1B type][2B topic BE][8B seq BE][payload...]
